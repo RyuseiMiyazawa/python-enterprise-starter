@@ -155,10 +155,16 @@ def main() -> None:
 
     enqueue_parser = subparsers.add_parser("enqueue", help="Enqueue a registered workflow.")
     enqueue_parser.add_argument("workflow")
+    enqueue_parser.add_argument("--priority", type=int, default=100)
+    enqueue_parser.add_argument("--scheduled-at-utc", default=None)
 
     work_parser = subparsers.add_parser("work", help="Process one queued workflow as a worker.")
     work_parser.add_argument("--worker-id", default="cli-worker")
     work_parser.add_argument("--lease-seconds", type=int, default=30)
+
+    cancel_parser = subparsers.add_parser("cancel", help="Cancel a queued job.")
+    cancel_parser.add_argument("job_id")
+    cancel_parser.add_argument("--reason", default="cancelled_by_user")
 
     args = parser.parse_args()
     command = args.command or "run"
@@ -197,7 +203,12 @@ def main() -> None:
             build_registry().create(args.workflow)
         except KeyError as exc:
             raise ValueError(str(exc)) from exc
-        job = default_store().enqueue_run(args.workflow, {"workflow_name": args.workflow})
+        job = default_store().enqueue_run(
+            args.workflow,
+            {"workflow_name": args.workflow},
+            priority=args.priority,
+            scheduled_at_utc=args.scheduled_at_utc,
+        )
         pprint(job)
         return
     if command == "work":
@@ -209,5 +220,8 @@ def main() -> None:
             lease_seconds=args.lease_seconds,
         )
         pprint(asyncio.run(worker.run_once()))
+        return
+    if command == "cancel":
+        pprint(default_store().cancel_job(args.job_id, args.reason))
         return
     raise ValueError(f"unknown command: {command}")

@@ -118,6 +118,10 @@ def render_dashboard_html() -> str:
           <button id="run">Run Workflow</button>
         </div>
         <div class="row">
+          <input id="priority" type="number" value="100" placeholder="priority">
+          <input id="scheduled" placeholder="scheduled_at_utc">
+        </div>
+        <div class="row">
           <button id="enqueue" class="secondary">Enqueue Workflow</button>
           <button id="process" class="secondary">Process Next Job</button>
         </div>
@@ -140,6 +144,8 @@ def render_dashboard_html() -> str:
     const traceBox = document.getElementById('trace');
     const eventsBox = document.getElementById('events');
     const queueBox = document.getElementById('queue');
+    const priorityInput = document.getElementById('priority');
+    const scheduledInput = document.getElementById('scheduled');
 
     function headers() {
       const token = tokenInput.value.trim();
@@ -193,9 +199,24 @@ def render_dashboard_html() -> str:
         card.innerHTML = `
           <div class="mono">${job.job_id}</div>
           <div><strong>${job.workflow_name}</strong></div>
-          <div>status=${job.status} attempts=${job.attempt_count}/${job.max_attempts}</div>
+          <div>status=${job.status} priority=${job.priority} effective=${job.effective_priority} attempts=${job.attempt_count}/${job.max_attempts}</div>
+          <div>scheduled=${job.scheduled_at_utc}</div>
           <div>${job.last_error || 'no error'}</div>
         `;
+        if (job.status === 'queued' || job.status === 'retryable' || job.status === 'leased') {
+          const button = document.createElement('button');
+          button.className = 'secondary';
+          button.textContent = 'Cancel';
+          button.onclick = async () => {
+            await fetch(`/queue/cancel${tokenQuery()}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', ...headers() },
+              body: JSON.stringify({ job_id: job.job_id, reason: 'cancelled_from_ui' })
+            });
+            await loadQueue();
+          };
+          card.appendChild(button);
+        }
         queueBox.appendChild(card);
       }
     }
@@ -215,7 +236,14 @@ def render_dashboard_html() -> str:
 
     async function enqueueWorkflow() {
       const name = workflowSelect.value;
-      await fetch(`/queue/${name}${tokenQuery()}`, { method: 'POST', headers: headers() });
+      await fetch(`/queue/${name}${tokenQuery()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...headers() },
+        body: JSON.stringify({
+          priority: Number(priorityInput.value || 100),
+          scheduled_at_utc: scheduledInput.value || null
+        })
+      });
       await loadQueue();
     }
 

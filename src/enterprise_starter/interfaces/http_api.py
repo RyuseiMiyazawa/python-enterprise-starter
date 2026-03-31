@@ -31,6 +31,7 @@ def build_openapi_spec() -> dict[str, object]:
             "/queue/{workflow_name}": {"post": {"summary": "Enqueue registered workflow"}},
             "/queue/dsl": {"post": {"summary": "Enqueue DSL workflow"}},
             "/queue/process": {"post": {"summary": "Process next queued job"}},
+            "/queue/cancel": {"post": {"summary": "Cancel queued or leased job"}},
             "/events": {"get": {"summary": "Server-sent event stream"}},
             "/ui": {"get": {"summary": "Static dashboard"}},
         },
@@ -133,6 +134,14 @@ class ControlPlaneApp:
                 return HTTPStatus.NOT_FOUND, {"error": "job not found"}, "application/json"
             self._event_hub.publish({"kind": "job_completed_api", "job_id": job_id, "worker_id": worker_id})
             return HTTPStatus.OK, {"job": job}, "application/json"
+        if parsed.path == "/queue/cancel":
+            job_id = str(payload["job_id"])
+            reason = str(payload.get("reason", "cancelled_by_user"))
+            job = self._store.cancel_job(job_id, reason)
+            if job is None:
+                return HTTPStatus.NOT_FOUND, {"error": "job not found"}, "application/json"
+            self._event_hub.publish({"kind": "job_cancelled", "job_id": job_id, "reason": reason})
+            return HTTPStatus.OK, {"job": job}, "application/json"
         if parsed.path == "/queue/process":
             worker_id = str(payload.get("worker_id", "worker-default"))
             lease_seconds = int(payload.get("lease_seconds", 30))
@@ -157,6 +166,8 @@ class ControlPlaneApp:
                 workflow_name,
                 {"workflow_name": workflow_name},
                 max_attempts=int(payload.get("max_attempts", 3)),
+                priority=int(payload.get("priority", 100)),
+                scheduled_at_utc=None if payload.get("scheduled_at_utc") is None else str(payload["scheduled_at_utc"]),
             )
             self._event_hub.publish({"kind": "job_enqueued", "job_id": job["job_id"], "workflow_name": workflow_name})
             return HTTPStatus.ACCEPTED, {"job": job}, "application/json"
@@ -185,7 +196,13 @@ class ControlPlaneApp:
         if parsed.path == "/queue/dsl":
             compiler = JsonWorkflowCompiler(build_operation_registry())
             workflow = compiler.compile_dict(payload)
-            job = self._store.enqueue_run("__dsl__", payload, max_attempts=int(payload.get("max_attempts", 3)))
+            job = self._store.enqueue_run(
+                "__dsl__",
+                payload,
+                max_attempts=int(payload.get("max_attempts", 3)),
+                priority=int(payload.get("priority", 100)),
+                scheduled_at_utc=None if payload.get("scheduled_at_utc") is None else str(payload["scheduled_at_utc"]),
+            )
             self._event_hub.publish({"kind": "job_enqueued", "job_id": job["job_id"], "workflow_name": workflow.name})
             return HTTPStatus.ACCEPTED, {"job": job, "workflow_name": workflow.name}, "application/json"
         return HTTPStatus.NOT_FOUND, {"error": "not found"}, "application/json"

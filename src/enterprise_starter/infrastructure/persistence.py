@@ -58,6 +58,8 @@ class SQLiteWorkflowRunStore:
                     workflow_name TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    scheduled_at_utc TEXT NOT NULL,
                     attempt_count INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL DEFAULT 3,
                     next_attempt_at_utc TEXT NOT NULL,
@@ -77,6 +79,8 @@ class SQLiteWorkflowRunStore:
                 for row in connection.execute("PRAGMA table_info(queued_runs)").fetchall()
             }
             migrations = [
+                ("priority", "ALTER TABLE queued_runs ADD COLUMN priority INTEGER NOT NULL DEFAULT 100"),
+                ("scheduled_at_utc", "ALTER TABLE queued_runs ADD COLUMN scheduled_at_utc TEXT NOT NULL DEFAULT ''"),
                 ("attempt_count", "ALTER TABLE queued_runs ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"),
                 ("max_attempts", "ALTER TABLE queued_runs ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 3"),
                 ("next_attempt_at_utc", "ALTER TABLE queued_runs ADD COLUMN next_attempt_at_utc TEXT NOT NULL DEFAULT ''"),
@@ -94,6 +98,12 @@ class SQLiteWorkflowRunStore:
                 """
                 UPDATE queued_runs
                 SET next_attempt_at_utc = COALESCE(NULLIF(next_attempt_at_utc, ''), created_at_utc)
+                """
+            )
+            connection.execute(
+                """
+                UPDATE queued_runs
+                SET scheduled_at_utc = COALESCE(NULLIF(scheduled_at_utc, ''), created_at_utc)
                 """
             )
             connection.commit()
@@ -238,9 +248,12 @@ class SQLiteWorkflowRunStore:
         workflow_name: str,
         payload: dict[str, Any],
         max_attempts: int = 3,
+        priority: int = 100,
+        scheduled_at_utc: str | None = None,
     ) -> dict[str, Any]:
         job_id = uuid4().hex
         now = utc_now_iso()
+        scheduled_at = scheduled_at_utc or now
         with closing(self._connect()) as connection:
             connection.execute(
                 """
@@ -249,6 +262,8 @@ class SQLiteWorkflowRunStore:
                     workflow_name,
                     payload_json,
                     status,
+                    priority,
+                    scheduled_at_utc,
                     attempt_count,
                     max_attempts,
                     next_attempt_at_utc,
@@ -260,16 +275,18 @@ class SQLiteWorkflowRunStore:
                     run_id,
                     last_error,
                     dead_letter_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
                     workflow_name,
                     json.dumps(payload, sort_keys=True),
                     "queued",
+                    priority,
+                    scheduled_at,
                     0,
                     max_attempts,
-                    now,
+                    scheduled_at,
                     now,
                     now,
                     None,
@@ -287,19 +304,31 @@ class SQLiteWorkflowRunStore:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         lease_expires = (now + timedelta(seconds=lease_seconds)).isoformat()
+        aging_window_minutes = 15
         with closing(self._connect()) as connection:
             row = connection.execute(
                 """
                 SELECT job_id
                 FROM queued_runs
                 WHERE (
-                    ((status = 'queued' OR status = 'retryable') AND next_attempt_at_utc <= ?)
+                    (
+                        (status = 'queued' OR status = 'retryable')
+                        AND next_attempt_at_utc <= ?
+                        AND scheduled_at_utc <= ?
+                    )
                     OR (status = 'leased' AND (lease_expires_at_utc IS NULL OR lease_expires_at_utc < ?))
                 )
-                ORDER BY created_at_utc ASC
+                ORDER BY
+                    CASE
+                        WHEN priority - CAST((((julianday(?) - julianday(created_at_utc)) * 1440.0) / ?) AS INTEGER) < 0
+                            THEN 0
+                        ELSE priority - CAST((((julianday(?) - julianday(created_at_utc)) * 1440.0) / ?) AS INTEGER)
+                    END ASC,
+                    scheduled_at_utc ASC,
+                    created_at_utc ASC
                 LIMIT 1
                 """,
-                (now_iso, now_iso),
+                (now_iso, now_iso, now_iso, now_iso, aging_window_minutes, now_iso, aging_window_minutes),
             ).fetchone()
             if row is None:
                 return None
@@ -336,6 +365,30 @@ class SQLiteWorkflowRunStore:
                   AND status = 'leased'
                 """,
                 (now_iso, now_iso, lease_expires, job_id, worker_id),
+            )
+            connection.commit()
+        if cursor.rowcount == 0:
+            return None
+        return self.get_queue_job(job_id)
+
+    def cancel_job(self, job_id: str, reason: str = "cancelled_by_user") -> dict[str, Any] | None:
+        now_iso = utc_now_iso()
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE queued_runs
+                SET status = 'cancelled',
+                    updated_at_utc = ?,
+                    lease_expires_at_utc = NULL,
+                    last_error = ?,
+                    dead_letter_reason = CASE
+                        WHEN dead_letter_reason IS NULL THEN ?
+                        ELSE dead_letter_reason
+                    END
+                WHERE job_id = ?
+                  AND status IN ('queued', 'retryable', 'leased')
+                """,
+                (now_iso, reason, reason, job_id),
             )
             connection.commit()
         if cursor.rowcount == 0:
@@ -432,6 +485,8 @@ class SQLiteWorkflowRunStore:
                     workflow_name,
                     payload_json,
                     status,
+                    priority,
+                    scheduled_at_utc,
                     attempt_count,
                     max_attempts,
                     next_attempt_at_utc,
@@ -460,6 +515,8 @@ class SQLiteWorkflowRunStore:
                     workflow_name,
                     payload_json,
                     status,
+                    priority,
+                    scheduled_at_utc,
                     attempt_count,
                     max_attempts,
                     next_attempt_at_utc,
@@ -481,20 +538,27 @@ class SQLiteWorkflowRunStore:
         return self._queue_row_to_dict(row)
 
     def _queue_row_to_dict(self, row: tuple[Any, ...]) -> dict[str, Any]:
+        effective_priority = max(
+            0,
+            int(row[4]) - int((datetime.now(timezone.utc) - datetime.fromisoformat(row[9])).total_seconds() // 900),
+        )
         return {
             "job_id": row[0],
             "workflow_name": row[1],
             "payload": json.loads(row[2]),
             "status": row[3],
-            "attempt_count": row[4],
-            "max_attempts": row[5],
-            "next_attempt_at_utc": row[6],
-            "created_at_utc": row[7],
-            "updated_at_utc": row[8],
-            "lease_owner": row[9],
-            "lease_expires_at_utc": row[10],
-            "heartbeat_at_utc": row[11],
-            "run_id": row[12],
-            "last_error": row[13],
-            "dead_letter_reason": row[14],
+            "priority": row[4],
+            "effective_priority": effective_priority,
+            "scheduled_at_utc": row[5],
+            "attempt_count": row[6],
+            "max_attempts": row[7],
+            "next_attempt_at_utc": row[8],
+            "created_at_utc": row[9],
+            "updated_at_utc": row[10],
+            "lease_owner": row[11],
+            "lease_expires_at_utc": row[12],
+            "heartbeat_at_utc": row[13],
+            "run_id": row[14],
+            "last_error": row[15],
+            "dead_letter_reason": row[16],
         }

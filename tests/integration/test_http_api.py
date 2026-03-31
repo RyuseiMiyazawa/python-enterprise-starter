@@ -101,3 +101,31 @@ class HttpApiIntegrationTests(unittest.TestCase):
         self.assertEqual(status.value, 200)
         self.assertEqual(content_type, "application/json")
         self.assertIn("/queue/process", payload["paths"])
+
+    def test_queue_enqueue_accepts_priority_and_schedule(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteWorkflowRunStore(Path(directory) / "runs.sqlite3")
+            app = ControlPlaneApp(build_registry(), store)
+            status, payload, _ = app.handle_post(
+                "/queue/prime-analytics",
+                {"priority": 7, "scheduled_at_utc": "2099-01-01T00:00:00+00:00"},
+            )
+
+        self.assertEqual(status.value, 202)
+        self.assertEqual(payload["job"]["priority"], 7)
+        self.assertEqual(payload["job"]["scheduled_at_utc"], "2099-01-01T00:00:00+00:00")
+
+    def test_control_plane_can_cancel_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = SQLiteWorkflowRunStore(Path(directory) / "runs.sqlite3")
+            app = ControlPlaneApp(build_registry(), store)
+            _, enqueue_payload, _ = app.handle_post("/queue/prime-analytics", {})
+            job_id = enqueue_payload["job"]["job_id"]
+            status, payload, _ = app.handle_post(
+                "/queue/cancel",
+                {"job_id": job_id, "reason": "user_stop"},
+            )
+
+        self.assertEqual(status.value, 200)
+        self.assertEqual(payload["job"]["status"], "cancelled")
+        self.assertEqual(payload["job"]["last_error"], "user_stop")
