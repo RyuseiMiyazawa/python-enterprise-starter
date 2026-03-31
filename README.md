@@ -16,6 +16,9 @@
 - `Bearer` トークン認可
 - 保存済み実行からのトレースエクスポート
 - 静的 Web UI ダッシュボード
+- SQLite ベースのジョブキュー
+- lease / heartbeat / retryable / dead-letter 対応
+- priority / scheduled_at / aging / cancellation 制御
 - 実行結果のサマリとクリティカルパス計測
 - CLI デモ付き
 
@@ -27,6 +30,9 @@ PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 PYTHONPATH=src python3 -m enterprise_starter workflows
 PYTHONPATH=src python3 -m enterprise_starter run advanced-analytics
 PYTHONPATH=src python3 -m enterprise_starter dsl-run examples/analytics_workflow.json
+PYTHONPATH=src python3 -m enterprise_starter enqueue prime-analytics --priority 5
+PYTHONPATH=src python3 -m enterprise_starter work --worker-id worker-a --lease-seconds 5
+PYTHONPATH=src python3 -m enterprise_starter cancel <job_id> --reason manual_stop
 PYTHONPATH=src python3 -m enterprise_starter serve --port 8080 --api-token secret-token
 PYTHONPATH=src python3 -m enterprise_starter history
 ```
@@ -37,8 +43,14 @@ HTTP API:
 - `GET /runs?limit=10`
 - `GET /traces/<run_id>`
 - `GET /ui`
+- `GET /queue?limit=20`
+- `GET /openapi.json`
 - `POST /runs/<workflow_name>`
 - `POST /dsl/runs`
+- `POST /queue/<workflow_name>`
+- `POST /queue/dsl`
+- `POST /queue/process`
+- `POST /queue/cancel`
 
 認可を使う場合は `Authorization: Bearer <token>` を付与します。
 ブラウザ UI / SSE では `?access_token=<token>` も使えます。
