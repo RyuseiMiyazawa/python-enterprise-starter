@@ -1,0 +1,37 @@
+{
+  "name": "dsl-analytics",
+  "max_concurrency": 4,
+  "tasks": [
+    {
+      "name": "seed",
+      "operation": "const",
+      "params": {
+        "value": [1, 2, 3, 4, 5]
+      },
+      "cache_ttl_seconds": 10
+    },
+    {
+      "name": "squares",
+      "operation": "map_square",
+      "dependencies": ["seed"]
+    },
+    {
+      "name": "sum_squares",
+      "operation": "reduce_sum",
+      "dependencies": ["squares"]
+    },
+    {
+      "name": "stats",
+      "operation": "stats",
+      "dependencies": ["squares"]
+    },
+    {
+      "name": "report",
+      "operation": "format_template",
+      "dependencies": ["sum_squares", "stats"],
+      "params": {
+        "template": "sum=${sum_squares} mean=${stats_mean} pstdev=${stats_pstdev}"
+      }
+    }
+  ]
+}
